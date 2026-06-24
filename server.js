@@ -102,7 +102,7 @@ app.post("/transcribe", upload.single("audio"), async function(req, res) {
       max_tokens: 512,
       messages: [{
         role: "user",
-        content: 'Analyse this voice note and return ONLY valid JSON, no markdown:\n\n"' + transcript + '"\n\nReturn: {"tags":["tag1","tag2"],"priority":"high|medium|low","actions":["action1"]}\n\nTags: 1-3 short words like urgent, reminder, task, idea, question, meeting, personal, follow-up. Priority: high=time-sensitive, medium=important, low=general. Actions: concrete to-dos or empty array.'
+        content: 'content: 'Analyse this voice note and return ONLY valid JSON, no markdown:\n\n"' + transcript + '"\n\nReturn: {"tags":["tag1","tag2"],"priority":"high|medium|low","actions":["action1"]}\n\n' + (req.body && req.body.customTags ? 'IMPORTANT: Only use tags from this list: ' + req.body.customTags + '. Pick 1-3 that fit.' : 'Tags: 1-3 short words like urgent, reminder, task, idea, question, meeting, personal, follow-up.') + ' Priority: high=time-sensitive, medium=important, low=general. Actions: concrete to-dos or empty array.'
       }]
     });
 
