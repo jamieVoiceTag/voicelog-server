@@ -154,15 +154,43 @@ app.post("/update-password", async function(req, res) {
   }
 });
 
+// Signup stored nothing about where the person came from, so there was no way
+// to tell an organic web signup from a Play-track tester. `display_mode` is the
+// decisive one: "standalone" means they were in the installed app, "browser"
+// means they found the site. Recorded best-effort - never fail a signup over it.
+async function recordSignupSource(userId, source, userAgent) {
+  try {
+    if (!userId) return;
+    var src = source || {};
+    var host = null;
+    if (src.referrer) {
+      try { host = new URL(src.referrer).hostname; } catch (e) { host = null; }
+    }
+    await supabase.from("signup_sources").insert({
+      user_id: userId,
+      referrer: src.referrer || null,
+      referrer_host: host,
+      landing_path: src.landingPath || null,
+      display_mode: src.displayMode || null,
+      utm: src.utm && Object.keys(src.utm).length ? src.utm : null,
+      user_agent: userAgent || null,
+      language: src.language || null
+    });
+  } catch (e) {
+    console.log("SIGNUP_SOURCE_LOG_ERROR " + (e && e.message));
+  }
+}
+
 app.post("/signup", async function(req, res) {
   try {
-    var { email, password } = req.body;
+    var { email, password, source } = req.body;
     var { data, error } = await supabase.auth.admin.createUser({
       email: email,
       password: password,
       email_confirm: true
     });
     if (error) return res.status(400).json({ error: error.message });
+    await recordSignupSource(data.user.id, source, req.headers["user-agent"]);
     res.json({ user: { id: data.user.id, email: data.user.email } });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -289,12 +317,43 @@ app.post("/save-sheets-url", async function(req, res) {
   }
 });
 
+// Until now the digest only reached people who were already active: the
+// 48-hour window skipped anyone with no recent notes, so the users most worth
+// recovering got nothing at all. It now sends two different things - a digest
+// to active users and a nudge to lapsed ones - and writes every send to
+// email_log, so what went out is a record rather than an inference.
+var MAIL_FROM = "ThinqNote <notes@thinqnote.com>"; // becomes Adnoto once Resend verifies adnoto.app
+var DIGEST_WINDOW_HOURS = 48;
+var NUDGE_MIN_DAYS_BETWEEN = 7;  // never nag more than weekly
+var NUDGE_MAX_LAPSED_DAYS = 30;  // past a month, stop entirely
+
+async function logEmail(userId, kind, notesCount, status, error) {
+  try {
+    await supabase.from("email_log").insert({
+      user_id: userId,
+      kind: kind,
+      notes_count: (notesCount === null || notesCount === undefined) ? null : notesCount,
+      status: status,
+      error: error ? String(error).slice(0, 500) : null
+    });
+  } catch (e) {
+    console.log("EMAIL_LOG_ERROR " + (e && e.message));
+  }
+}
+
+function mailShell(inner) {
+  return '<div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;max-width:600px;margin:0 auto;padding:0 16px">' +
+    '<div style="padding:24px 0;text-align:center"><span style="font-size:22px;font-weight:700;color:#1a1a2e">Ad</span><span style="font-size:22px;font-weight:700;color:#7A2E63">noto</span></div>' +
+    inner +
+    '<div style="padding:24px 0;text-align:center;color:#8891A5;font-size:12px">From <a href="https://adnoto.app" style="color:#7A2E63;text-decoration:none">Adnoto</a> &mdash; turn this off in Settings</div>' +
+    '</div>';
+}
+
 app.get("/send-daily-emails", async function(req, res) {
   try {
     var debug = {
       resendInitialized: !!resend,
-      resendKeyPresent: !!process.env.RESEND_API_KEY,
-      resendKeyPrefix: process.env.RESEND_API_KEY ? process.env.RESEND_API_KEY.substring(0, 8) : "none"
+      resendKeyPresent: !!process.env.RESEND_API_KEY
     };
 
     var { data: settings } = await supabase
@@ -303,27 +362,27 @@ app.get("/send-daily-emails", async function(req, res) {
       .eq("daily_email", true);
 
     debug.usersOptedIn = settings ? settings.length : 0;
-
     if (!settings || settings.length === 0) {
-      return res.json({ sent: 0, debug: debug });
+      console.log("DAILY_EMAIL opted_in=0 digests=0 nudges=0 skipped=0");
+      return res.json({ digests: 0, nudges: 0, skipped: 0, debug: debug });
     }
 
     var now = new Date();
-    var cutoff = new Date(now.getTime() - 48 * 60 * 60 * 1000).toISOString();
-    var sent = 0;
+    var cutoff = new Date(now.getTime() - DIGEST_WINDOW_HOURS * 3600 * 1000).toISOString();
+    var digests = 0, nudges = 0, skipped = 0;
     var errors = [];
+    var skipReasons = {};
+
+    function skip(reason) { skipped++; skipReasons[reason] = (skipReasons[reason] || 0) + 1; }
 
     for (var i = 0; i < settings.length; i++) {
       var userId = settings[i].user_id;
 
       var { data: userData, error: userErr } = await supabase.auth.admin.getUserById(userId);
-      if (userErr || !userData || !userData.user) {
-        errors.push("user fetch failed: " + (userErr ? userErr.message : "no user"));
-        continue;
-      }
-
+      if (userErr || !userData || !userData.user) { skip("user_fetch_failed"); continue; }
       var email = userData.user.email;
-      debug.userEmail = email;
+
+      if (!resend) { errors.push("Resend not initialized"); skip("resend_missing"); continue; }
 
       var { data: notes, error: notesErr } = await supabase
         .from("notes")
@@ -331,54 +390,111 @@ app.get("/send-daily-emails", async function(req, res) {
         .eq("user_id", userId)
         .gte("created_at", cutoff)
         .order("created_at", { ascending: true });
+      if (notesErr) { errors.push("notes error: " + notesErr.message); skip("notes_error"); continue; }
 
-      debug.notesFound = notes ? notes.length : 0;
-      debug.cutoff = cutoff;
+      // ---------- active user: the digest ----------
+      if (notes && notes.length > 0) {
+        var noteRows = notes.map(function(n) {
+          var d = new Date(n.created_at);
+          var time = d.getHours() + ":" + ("0" + d.getMinutes()).slice(-2);
+          var tags = n.tags ? '<span style="color:#7A2E63">[' + n.tags + ']</span> ' : '';
+          var priority = n.priority ? '<span style="color:' + (n.priority === 'high' ? '#E5484D' : n.priority === 'medium' ? '#BD5B00' : '#1B873F') + '">(' + n.priority + ')</span> ' : '';
+          var actions = n.actions ? '<br><span style="color:#8891A5;font-size:13px">&#10003; ' + n.actions + '</span>' : '';
+          return '<tr><td style="padding:12px 16px;border-bottom:1px solid #f0f2f5;vertical-align:top;color:#8891A5;font-size:13px;white-space:nowrap">' + time + '</td><td style="padding:12px 16px;border-bottom:1px solid #f0f2f5;font-size:14px;color:#1a1a2e">' + tags + priority + n.transcript + actions + '</td></tr>';
+        }).join("");
 
-      if (notesErr) { errors.push("notes error: " + notesErr.message); continue; }
-      if (!notes || notes.length === 0) { errors.push("no recent notes for: " + email); continue; }
+        var digestHtml = mailShell(
+          '<div style="padding:16px 20px;background:#f7f8fa;border-radius:12px;margin-bottom:20px;text-align:center;color:#5A6478">Your recent notes &mdash; <strong>' + notes.length + ' note' + (notes.length === 1 ? '' : 's') + '</strong></div>' +
+          '<table style="width:100%;border-collapse:collapse">' + noteRows + '</table>'
+        );
 
-      var noteRows = notes.map(function(n) {
-        var d = new Date(n.created_at);
-        var time = d.getHours() + ":" + ("0" + d.getMinutes()).slice(-2);
-        var tags = n.tags ? '<span style="color:#4F6DF5">[' + n.tags + ']</span> ' : '';
-        var priority = n.priority ? '<span style="color:' + (n.priority === 'high' ? '#E5484D' : n.priority === 'medium' ? '#BD5B00' : '#1B873F') + '">(' + n.priority + ')</span> ' : '';
-        var actions = n.actions ? '<br><span style="color:#8891A5;font-size:13px">&#10003; ' + n.actions + '</span>' : '';
-        return '<tr><td style="padding:12px 16px;border-bottom:1px solid #f0f2f5;vertical-align:top;color:#8891A5;font-size:13px;white-space:nowrap">' + time + '</td><td style="padding:12px 16px;border-bottom:1px solid #f0f2f5;font-size:14px;color:#1a1a2e">' + tags + priority + n.transcript + actions + '</td></tr>';
-      }).join("");
-
-      var html = '<div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;max-width:600px;margin:0 auto;padding:0 16px">';
-      html += '<div style="padding:24px 0;text-align:center"><span style="font-size:22px;font-weight:700;color:#1a1a2e">Ad</span><span style="font-size:22px;font-weight:700;color:#7A2E63">noto</span></div>';
-      html += '<div style="padding:16px 20px;background:#f7f8fa;border-radius:12px;margin-bottom:20px;text-align:center;color:#5A6478">Your recent notes — <strong>' + notes.length + ' note' + (notes.length === 1 ? '' : 's') + '</strong></div>';
-      html += '<table style="width:100%;border-collapse:collapse">' + noteRows + '</table>';
-      html += '<div style="padding:24px 0;text-align:center;color:#8891A5;font-size:12px">From <a href="https://adnoto.app" style="color:#7A2E63;text-decoration:none">Adnoto</a> — turn this off in Settings</div>';
-      html += '</div>';
-
-      if (!resend) {
-        errors.push("Resend not initialized - key: " + (process.env.RESEND_API_KEY ? "present" : "missing"));
+        try {
+          var sendResult = await resend.emails.send({
+            from: MAIL_FROM,
+            to: email,
+            subject: "Your Adnoto summary — " + notes.length + " note" + (notes.length === 1 ? "" : "s"),
+            html: digestHtml
+          });
+          if (sendResult.error) {
+            errors.push("Resend error: " + JSON.stringify(sendResult.error));
+            await logEmail(userId, "digest", notes.length, "failed", JSON.stringify(sendResult.error));
+          } else {
+            digests++;
+            await logEmail(userId, "digest", notes.length, "sent", null);
+          }
+        } catch (sendErr) {
+          errors.push("Send exception: " + sendErr.message);
+          await logEmail(userId, "digest", notes.length, "failed", sendErr.message);
+        }
         continue;
       }
 
+      // ---------- lapsed user: the nudge ----------
+      // Guarded three ways so this can never become a daily nag: they must have
+      // actually used the app, must not be long gone, and must not have had a
+      // nudge in the last week.
+      var { data: lastNotes } = await supabase
+        .from("notes")
+        .select("created_at")
+        .eq("user_id", userId)
+        .order("created_at", { ascending: false })
+        .limit(1);
+
+      if (!lastNotes || lastNotes.length === 0) { skip("never_recorded"); continue; }
+
+      var daysSince = (now - new Date(lastNotes[0].created_at)) / 86400000;
+      if (daysSince > NUDGE_MAX_LAPSED_DAYS) { skip("long_gone"); continue; }
+
+      var nudgeCutoff = new Date(now.getTime() - NUDGE_MIN_DAYS_BETWEEN * 86400000).toISOString();
+      var { data: recentNudge } = await supabase
+        .from("email_log")
+        .select("id")
+        .eq("user_id", userId)
+        .eq("kind", "nudge")
+        .eq("status", "sent")
+        .gte("created_at", nudgeCutoff)
+        .limit(1);
+
+      if (recentNudge && recentNudge.length > 0) { skip("nudged_recently"); continue; }
+
+      var days = Math.floor(daysSince);
+      var nudgeHtml = mailShell(
+        '<div style="padding:20px;background:#f7f8fa;border-radius:12px;margin-bottom:20px;color:#5A6478;line-height:1.55">' +
+        'You haven\'t captured anything for ' + days + ' day' + (days === 1 ? '' : 's') + '. ' +
+        'If something has been on your mind today, it takes about ten seconds to get it down.' +
+        '</div>' +
+        '<div style="text-align:center;padding:4px 0 8px">' +
+        '<a href="https://adnoto.app" style="display:inline-block;padding:13px 26px;background:#7A2E63;color:#ffffff;border-radius:12px;text-decoration:none;font-weight:600;font-size:15px">Record a note</a>' +
+        '</div>'
+      );
+
       try {
-        var sendResult = await resend.emails.send({
-          from: "ThinqNote <notes@thinqnote.com>",
+        var nudgeResult = await resend.emails.send({
+          from: MAIL_FROM,
           to: email,
-          subject: "Your Adnoto summary — " + notes.length + " note" + (notes.length === 1 ? "" : "s"),
-          html: html
+          subject: "Anything worth capturing today?",
+          html: nudgeHtml
         });
-        if (sendResult.error) {
-          errors.push("Resend error: " + JSON.stringify(sendResult.error));
+        if (nudgeResult.error) {
+          errors.push("Resend error (nudge): " + JSON.stringify(nudgeResult.error));
+          await logEmail(userId, "nudge", 0, "failed", JSON.stringify(nudgeResult.error));
         } else {
-          sent++;
-          debug.sendResult = sendResult;
+          nudges++;
+          await logEmail(userId, "nudge", 0, "sent", null);
         }
-      } catch(sendErr) {
-        errors.push("Send exception: " + sendErr.message);
+      } catch (sendErr) {
+        errors.push("Nudge exception: " + sendErr.message);
+        await logEmail(userId, "nudge", 0, "failed", sendErr.message);
       }
     }
 
-    res.json({ sent: sent, errors: errors, debug: debug });
+    console.log("DAILY_EMAIL opted_in=" + settings.length + " digests=" + digests +
+                " nudges=" + nudges + " skipped=" + skipped +
+                " reasons=" + JSON.stringify(skipReasons));
+
+    res.json({ digests: digests, nudges: nudges, skipped: skipped, skipReasons: skipReasons, errors: errors, debug: debug });
   } catch (err) {
+    console.log("DAILY_EMAIL_FAILED " + err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -442,6 +558,59 @@ app.get("/subscription", async function(req, res) {
   }
 });
 
+// Recordings can fail in two places and until now both were invisible: in the
+// browser before anything is uploaded (mic denied, MediaRecorder error, an
+// empty blob), and here when Whisper returns an empty transcript. Both cost us
+// a tester and neither left a trace, so record them. Best-effort only - a
+// failure to log a failure must never break the response.
+async function recordCaptureFailure(fields) {
+  try {
+    console.log("CAPTURE_FAILURE " + JSON.stringify(fields));
+    await supabase.from("capture_failures").insert({
+      user_id: fields.userId || null,
+      stage: fields.stage,
+      message: fields.message || null,
+      audio_bytes: fields.audioBytes || null,
+      audio_mime: fields.audioMime || null,
+      duration_seconds: fields.durationSeconds || null,
+      user_agent: fields.userAgent || null,
+      detail: fields.detail || null
+    });
+  } catch (e) {
+    console.log("CAPTURE_FAILURE_LOG_ERROR " + (e && e.message));
+  }
+}
+
+// Called by the frontend when a recording never makes it as far as an upload.
+// Deliberately tolerant: it authenticates if it can, but still records the
+// failure anonymously rather than rejecting it, because the whole point is to
+// capture problems that happen when things are already going wrong.
+app.post("/capture-failure", async function(req, res) {
+  try {
+    var userId = null;
+    var token = req.headers.authorization;
+    if (token) {
+      try {
+        var r = await supabase.auth.getUser(token.replace("Bearer ", ""));
+        if (r && r.data && r.data.user) userId = r.data.user.id;
+      } catch (e) { /* anonymous is fine */ }
+    }
+    await recordCaptureFailure({
+      userId: userId,
+      stage: (req.body && req.body.stage) || "unknown",
+      message: req.body && req.body.message,
+      audioBytes: req.body && req.body.audioBytes,
+      audioMime: req.body && req.body.audioMime,
+      durationSeconds: req.body && req.body.durationSeconds,
+      userAgent: req.headers["user-agent"],
+      detail: req.body && req.body.detail
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    res.json({ ok: false });
+  }
+});
+
 app.post("/transcribe", upload.single("audio"), async function(req, res) {
   try {
     var token = req.headers.authorization;
@@ -483,7 +652,26 @@ app.post("/transcribe", upload.single("audio"), async function(req, res) {
     });
 
     var transcript = transcription.trim();
-    if (!transcript) return res.status(400).json({ error: "Could not transcribe audio" });
+    if (!transcript) {
+      // Whisper got the audio and heard nothing in it. Almost always a silent
+      // recording - mic muted, permission granted but no input, or audio routed
+      // to a Bluetooth device that never opened its stream. The old message
+      // ("Could not transcribe audio") read like an app fault and told the user
+      // nothing they could act on, so say what actually happened.
+      await recordCaptureFailure({
+        userId: user.id,
+        stage: "empty_transcript",
+        message: "Whisper returned an empty transcript",
+        audioBytes: req.file.buffer ? req.file.buffer.length : null,
+        audioMime: req.file.mimetype,
+        userAgent: req.headers["user-agent"],
+        detail: { uploadName: uploadName }
+      });
+      return res.status(400).json({
+        error: "We couldn't hear anything in that recording. Check your microphone isn't muted — and if you're on Bluetooth headphones, try switching them off and recording again.",
+        reason: "empty_transcript"
+      });
+    }
 
     var userTags = req.body && req.body.customTags ? req.body.customTags : "";
     var tagInstruction = "";
