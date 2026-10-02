@@ -668,7 +668,7 @@ app.post("/transcribe", upload.single("audio"), async function(req, res) {
         detail: { uploadName: uploadName }
       });
       return res.status(400).json({
-        error: "We couldn't hear anything in that recording. Check your microphone isn't muted — and if you're on Bluetooth headphones, try switching them off and recording again.",
+        error: "We didn't hear anything. Nothing was saved, so no note is lost. Check your microphone isn't muted — and if you're on Bluetooth headphones, switch them off and try again.",
         reason: "empty_transcript"
       });
     }
