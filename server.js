@@ -19,13 +19,56 @@ function getResend() {
 }
 const resend = getResend();
 
+// This endpoint previously trusted whatever was POSTed to it: it parsed the
+// body and upgraded the account named in metadata.user_id, with no proof the
+// request came from Stripe. Anyone who found the URL could grant themselves a
+// paid plan. It now verifies Stripe's signature and FAILS CLOSED - without the
+// signing secret it refuses to process anything, rather than falling back to
+// the old trusting behaviour.
+//
+// It also handles the rest of the subscription lifecycle. Only
+// checkout.session.completed was handled before, so a cancelled or unpaid
+// subscription kept its plan indefinitely.
+async function setPlanForSubscription(stripeSubscriptionId, plan, reason) {
+  if (!stripeSubscriptionId) return;
+  var { data: rows } = await supabase
+    .from("subscriptions")
+    .select("user_id")
+    .eq("stripe_subscription_id", stripeSubscriptionId)
+    .limit(1);
+  if (!rows || rows.length === 0) {
+    console.log("STRIPE_WEBHOOK no local subscription for " + stripeSubscriptionId);
+    return;
+  }
+  await supabase.from("subscriptions").update({
+    plan: plan,
+    updated_at: new Date().toISOString()
+  }).eq("stripe_subscription_id", stripeSubscriptionId);
+  console.log("STRIPE_WEBHOOK " + reason + " -> plan=" + plan + " sub=" + stripeSubscriptionId);
+}
+
 app.post("/stripe-webhook", express.raw({ type: "application/json" }), async function(req, res) {
+  var secret = process.env.STRIPE_WEBHOOK_SECRET;
+  if (!secret) {
+    // Deliberately refuse rather than process unverified events. If this fires,
+    // STRIPE_WEBHOOK_SECRET is missing from the Railway environment.
+    console.log("STRIPE_WEBHOOK_REJECTED missing STRIPE_WEBHOOK_SECRET");
+    return res.status(500).json({ error: "Webhook not configured" });
+  }
+
+  var event;
   try {
-    var event = JSON.parse(req.body);
+    event = stripe.webhooks.constructEvent(req.body, req.headers["stripe-signature"], secret);
+  } catch (err) {
+    console.log("STRIPE_WEBHOOK_BAD_SIGNATURE " + (err && err.message));
+    return res.status(400).json({ error: "Invalid signature" });
+  }
+
+  try {
     if (event.type === "checkout.session.completed") {
       var session = event.data.object;
-      var userId = session.metadata.user_id;
-      var plan = session.metadata.plan || "basic";
+      var userId = session.metadata && session.metadata.user_id;
+      var plan = (session.metadata && session.metadata.plan) || "basic";
       if (userId) {
         await supabase.from("subscriptions").upsert({
           user_id: userId,
@@ -34,11 +77,31 @@ app.post("/stripe-webhook", express.raw({ type: "application/json" }), async fun
           stripe_subscription_id: session.subscription,
           updated_at: new Date().toISOString()
         }, { onConflict: "user_id" });
+        console.log("STRIPE_WEBHOOK checkout.completed -> plan=" + plan + " user=" + userId);
       }
+
+    } else if (event.type === "customer.subscription.deleted") {
+      await setPlanForSubscription(event.data.object.id, "free", "subscription.deleted");
+
+    } else if (event.type === "customer.subscription.updated") {
+      // Stripe retries a failed payment for a while before giving up, so only
+      // drop the plan once the subscription is genuinely no longer active.
+      var sub = event.data.object;
+      var dead = ["canceled", "unpaid", "incomplete_expired"];
+      if (dead.indexOf(sub.status) > -1) {
+        await setPlanForSubscription(sub.id, "free", "subscription." + sub.status);
+      }
+
+    } else if (event.type === "invoice.payment_failed") {
+      // Not a downgrade on its own - Stripe will retry. Logged so a run of
+      // these is visible before the subscription actually lapses.
+      console.log("STRIPE_WEBHOOK payment_failed sub=" + (event.data.object.subscription || "?"));
     }
+
     res.json({ received: true });
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    console.log("STRIPE_WEBHOOK_ERROR " + (err && err.message));
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -510,7 +573,7 @@ app.post("/create-checkout", async function(req, res) {
 
     var selectedPlan = req.body.plan || "basic";
     var priceId = selectedPlan === "pro" ? process.env.STRIPE_PRICE_ID_PRO : process.env.STRIPE_PRICE_ID;
-    var appUrl = req.headers.origin || req.headers.referer || "https://example.com";
+    var appUrl = req.headers.origin || req.headers.referer || "https://adnoto.app";
 
     var session = await stripe.checkout.sessions.create({
       mode: "subscription",
